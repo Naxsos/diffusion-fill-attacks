@@ -12,8 +12,10 @@ Launch (the diffusion server must already be running -- see SERVER.md):
 
 from __future__ import annotations
 
+import datetime
 import json
 import math
+import os
 import traceback
 
 import altair as alt
@@ -617,9 +619,17 @@ with st.sidebar:
         "🗑 Clear setup",
         on_click=_clear_setup_only,
         use_container_width=True,
-        help="Reset prompt and targets back to defaults. "
-             "Last run result and run log are kept.",
+        help="Reset prompt and targets back to defaults. Last run and log are kept.",
     )
+    if st.button("➕ New run", use_container_width=True,
+                 help="Switch to Setup tab. Your prompt and targets are kept."):
+        st.session_state["active_tab"] = "Setup"
+        st.rerun()
+    if st.button("🧹 Clear & start over", use_container_width=True,
+                 help="Reset everything — prompt, targets, last run — back to defaults."):
+        _reset_form_state()
+        st.session_state["active_tab"] = "Setup"
+        st.rerun()
 
     if "last_run" in st.session_state:
         st.caption(
@@ -986,6 +996,31 @@ if submitted:
         "baseline": base["text"],
         "steered": result["text"],
     })
+    # Save full run to frontend_runs/ with a timestamp-based filename.
+    _runs_dir = os.path.join(os.path.dirname(__file__), "frontend_runs")
+    os.makedirs(_runs_dir, exist_ok=True)
+    _ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    _run_file = os.path.join(_runs_dir, f"run_{_ts}.json")
+    _run_payload = {
+        "timestamp": _ts,
+        "prompt": prompt,
+        "config": {
+            "targets": targets, "start_pos": start_pos,
+            "modes": modes, "steps": steps,
+            "k": int(k), "prob": probs_per_target, "seed": int(seed),
+        },
+        "baseline": base["text"],
+        "steered": result["text"],
+        "landed": landed,
+        "positions": result["positions"],
+        "all_held": result["all_held"],
+        "interventions": result["interventions"],
+        "trace_positions": tp,
+        "trace_topk": int(trace_topk),
+        "trace": decoded,
+    }
+    with open(_run_file, "w") as _f:
+        json.dump(_run_payload, _f, indent=2)
     # Auto-switch to the Results tab on a successful run.
     st.session_state["_pending_tab"] = "Results"
     st.rerun()
@@ -1000,34 +1035,37 @@ if active_tab == "Results":
     if last is None:
         st.info("No run yet. Fill in inputs above and click **Run experiment**.")
     else:
-        # Header strip: a primary "New run" CTA on the left, a quieter "Clear & start
-        # over" on the right. "New run" returns to Setup with the prompt + targets
-        # intact so iterating is one click; "Clear & start over" wipes everything.
-        rh1, rh2, rh3 = st.columns([1.1, 1.4, 4.5], vertical_alignment="center")
-        if rh1.button("➕ New run", type="primary", use_container_width=True,
-                      help="Go back to Setup. Your prompt and targets are kept so you can "
-                           "tweak them and run again."):
-            st.session_state["_pending_tab"] = "Setup"
-            st.rerun()
-        if rh2.button("🧹 Clear & start over", use_container_width=True,
-                      help="Reset prompt, targets, and the last run -- like opening the app "
-                           "fresh."):
-            _reset_form_state()
-            st.session_state["_pending_tab"] = "Setup"
-            st.rerun()
-        rh3.markdown(
-            "<div style='text-align:right;color:#888;font-size:0.85rem;padding-top:0.4rem'>"
+        st.markdown(
+            "<div style='text-align:right;color:#888;font-size:0.85rem;padding-bottom:0.4rem'>"
             f"trace records: <b>{len(last.get('decoded') or [])}</b> · "
             f"steered positions: <b>{len(last['positions'])}</b></div>",
             unsafe_allow_html=True,
         )
 
         st.divider()
-        c1, c2 = st.columns([1, 2])
-        c1.metric("Pinned positions", len(last["positions"]))
-        c2.metric("All pins held?", "✅ yes" if last["all_held"] else "⚠️ no")
+        c1, c2 = st.columns(2)
+        c1.markdown(
+            f"<div style='background:#fafafa;border:1px solid #eee;border-radius:8px;"
+            f"padding:0.4rem 0.8rem'>"
+            f"<div style='font-size:0.78rem;color:#666'>Pinned positions</div>"
+            f"<div style='font-size:1.1rem;font-weight:600'>{len(last['positions'])}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        held_color = "#166534" if last["all_held"] else "#92400e"
+        held_bg = "#dcfce7" if last["all_held"] else "#fef3c7"
+        held_text = "✅ yes" if last["all_held"] else "⚠️ no"
+        c2.markdown(
+            f"<div style='background:{held_bg};border:1px solid #eee;border-radius:8px;"
+            f"padding:0.4rem 0.8rem'>"
+            f"<div style='font-size:0.78rem;color:#666'>All pins held?</div>"
+            f"<div style='font-size:1.1rem;font-weight:600;color:{held_color}'>{held_text}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
-        with st.expander(f"Landed text: `{last['landed']!r}`", expanded=False):
+        st.markdown("<div style='margin-top:0.6rem'></div>", unsafe_allow_html=True)
+        with st.expander(f"**Landed text** — `{last['landed']!r}`", expanded=False):
             st.code(last["landed"], language=None)
 
         st.divider()
