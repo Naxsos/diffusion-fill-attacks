@@ -340,8 +340,8 @@ st.set_page_config(page_title="DiffusionGemma fill-attack workbench", layout="wi
 st.markdown(
     """
     <style>
-      .block-container {padding-top: 1rem !important; padding-bottom: 2rem !important;}
-      header[data-testid="stHeader"] {height: 2.5rem;}
+      .block-container {padding-top: 3rem !important; padding-bottom: 2rem !important;}
+      header[data-testid="stHeader"] {height: 3.5rem;}
       h1, h2, h3, h4 {margin-top: 0.2rem !important; margin-bottom: 0.4rem !important;}
       div[data-testid="stTabs"] {margin-top: 0.2rem;}
     </style>
@@ -435,19 +435,23 @@ with st.sidebar:
             value="", help="space-separated extra canvas positions to record",
         )
 
-# --- Top tab nav (radio styled as tabs; programmatic switch on run) -------
+# --- Top tab nav (styled buttons; programmatic switch on run) ---------------
 TABS = ["Setup", "Results", "Convergence"]
-# A successful run sets _pending_tab; we consume it here, before the widget
-# is instantiated, so we never write to the widget's own key after creation.
 if "_pending_tab" in st.session_state:
     st.session_state["active_tab"] = st.session_state.pop("_pending_tab")
-active_tab = st.radio(
-    "view", TABS,
-    index=TABS.index(st.session_state.get("active_tab", "Setup")),
-    horizontal=True,
-    label_visibility="collapsed",
-    key="active_tab",
-)
+active_tab = st.session_state.get("active_tab", "Setup")
+
+tab_cols = st.columns(len(TABS))
+for col, tab in zip(tab_cols, TABS):
+    if col.button(
+        tab,
+        use_container_width=True,
+        type="primary" if tab == active_tab else "secondary",
+    ):
+        st.session_state["active_tab"] = tab
+        st.rerun()
+
+st.divider()
 
 # Pull rows + nonce -- both sit in session_state and are always available.
 rows = st.session_state["rows"]
