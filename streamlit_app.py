@@ -344,11 +344,14 @@ def _step_canvas_html(decoded: list[dict], step_idx: int, positions: list[int],
         cands = rec["positions"].get(pos, [])
         # Anchor wraps each cell so a click sets ?focus=N, which the script reads on
         # rerun to drive the right-pane distribution dropdown. `#canvas-anchor` keeps
-        # the page from jumping back to the top after the rerun.
+        # the page from jumping back to the top after the rerun. `target="_top"` is
+        # critical: Streamlit renders unsafe_allow_html inside a sandboxed iframe, so
+        # without it the navigation happens *inside the iframe* and Streamlit never
+        # sees the new query param.
         href = f"?focus={pos}#canvas-anchor"
         if not cands:
             spans.append(
-                f"<a href='{href}' style='text-decoration:none;'>"
+                f"<a href='{href}' target='_top' style='text-decoration:none;'>"
                 f"<span style='opacity:.4;color:var(--df-muted)'>·</span></a>"
             )
             continue
@@ -393,7 +396,7 @@ def _step_canvas_html(decoded: list[dict], step_idx: int, positions: list[int],
             title = f"pos {pos} · p={post_prob:.2f}"
 
         spans.append(
-            f"<a href='{href}' style='text-decoration:none;cursor:pointer;'>"
+            f"<a href='{href}' target='_top' style='text-decoration:none;cursor:pointer;'>"
             f"<span title='{title}' "
             f"style='display:inline-block;margin:1px;padding:1px 4px;"
             f"font-weight:{weight};color:{txt};border:{border};border-radius:3px;"
@@ -1394,10 +1397,17 @@ if active_tab == "Convergence":
         st.markdown("<div id='canvas-anchor'></div>", unsafe_allow_html=True)
 
         ctop1, ctop2 = st.columns([3, 2])
+        # Persist the step across reruns triggered by token clicks (see ?focus=N
+        # below) — without a key, the slider would snap back to the default each
+        # time the user clicked a canvas token.
+        if "step_widget" not in st.session_state:
+            st.session_state["step_widget"] = int(all_steps[-1])
+        elif not (int(all_steps[0]) <= st.session_state["step_widget"] <= int(all_steps[-1])):
+            st.session_state["step_widget"] = int(all_steps[-1])
         step = ctop1.slider(
             "denoising step",
             min_value=int(all_steps[0]), max_value=int(all_steps[-1]),
-            value=int(all_steps[-1]), step=1,
+            step=1, key="step_widget",
         )
         # Default the dropdown to the last position on first render; thereafter it's
         # driven by `focus_pos_widget` (either user-selected or set from ?focus=N).
