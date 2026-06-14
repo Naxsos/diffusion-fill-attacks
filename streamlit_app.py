@@ -597,6 +597,7 @@ def _form_is_dirty() -> bool:
 def _reset_form_state() -> None:
     """Wipe the prompt + rows + last-run + uploader nonce back to defaults."""
     st.session_state["prompt_text"] = defaults.prompt
+    st.session_state.pop("_prompt_widget", None)
     st.session_state["rows"] = [dict(DEFAULT_ROW)]
     st.session_state["rows_nonce"] = st.session_state.get("rows_nonce", 0) + 1
     st.session_state["uploader_nonce"] = st.session_state.get("uploader_nonce", 0) + 1
@@ -607,6 +608,7 @@ def _reset_form_state() -> None:
 def _clear_setup_only() -> None:
     """Reset prompt + targets but keep last_run and the run log."""
     st.session_state["prompt_text"] = defaults.prompt
+    st.session_state.pop("_prompt_widget", None)
     st.session_state["rows"] = [dict(DEFAULT_ROW)]
     st.session_state["rows_nonce"] = st.session_state.get("rows_nonce", 0) + 1
     st.session_state["uploader_nonce"] = st.session_state.get("uploader_nonce", 0) + 1
