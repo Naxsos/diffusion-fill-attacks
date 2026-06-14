@@ -1890,18 +1890,29 @@ if active_tab == "Convergence":
             )
             stride = max(1, len(all_steps) // 24)
             sampled = all_steps[::stride]
+            if all_steps[0] not in sampled:
+                sampled.insert(0, all_steps[0])
             if all_steps[-1] not in sampled:
                 sampled.append(all_steps[-1])
+            first_step = all_steps[0]
             rows_html = []
             for s in sampled:
                 canvas = _step_canvas_html(decoded, s, all_positions, steered_set, focus=int(focus_pos))
                 highlight = "background:#fff7d6;" if s == step else ""
+                if s == first_step:
+                    step_label = (
+                        f"<span style='font-weight:700;color:#4f46e5'>step {s:>3}</span>"
+                        f"<span style='display:block;font-size:9px;color:#a5b4fc;"
+                        f"letter-spacing:0.04em'>start</span>"
+                    )
+                else:
+                    step_label = f"step {s:>3}"
                 rows_html.append(
                     f"<div style='display:flex;align-items:center;gap:10px;"
                     f"padding:4px 6px;border-bottom:1px solid #eee;"
                     f"{highlight}font-family:monospace;font-size:13px'>"
                     f"<div style='width:64px;color:#888;font-size:11px'>"
-                    f"step {s:>3}</div>"
+                    f"{step_label}</div>"
                     f"<div>{canvas}</div></div>"
                 )
             # Film-strip lives in the same iframe as the main canvas so token clicks
