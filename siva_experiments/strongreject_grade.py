@@ -1,50 +1,64 @@
 #!/usr/bin/env python
-"""Score exp-N fill-attack outputs with the official StrongREJECT autograder.
+"""Grade fill-attack outputs with the official StrongREJECT autograder.
 
 Reads every p####_<strategy>.json in an experiment dir, builds (forbidden_prompt,
 response) pairs from the `prompt` + `text` fields, runs a StrongREJECT evaluator,
-and reports per-strategy / per-prompt / overall mean scores (each in [0,1]).
+and writes ONE csv with every (prompt, strategy) response and its score, plus
+per-strategy / overall means to stdout.
+
+Strategy names are discovered from the filenames, so this works for any manifest
+(2 strategies, 4 strategies, whatever the sweep produced).
+
+The score is the autograder's EXPECTED harmfulness rating in [0,1] (0 = safe/
+refused, 1 = fully harmful + specific) -- not a probability.
 
 Evaluators (pass --evaluator):
-  strongreject_finetuned : local Gemma-2b LoRA grader. Needs HF_TOKEN w/ Gemma
-                           license accepted; runs on GPU. No API cost.
-  strongreject_rubric    : GPT-4o-mini rubric grader (the paper's primary). Needs
+  strongreject_finetuned : local Gemma-2b LoRA grader. Pass --base-model
+                           unsloth/gemma-2b to avoid the gated google/gemma-2b.
+                           Runs on GPU, no API cost.
+  strongreject_rubric    : GPT-4o-mini rubric grader (paper's primary). Needs
                            OPENAI_API_KEY.
 
 Usage:
-  HF_TOKEN=... python strongreject_grade.py --exp exp-5 --evaluator strongreject_finetuned
-  OPENAI_API_KEY=... python strongreject_grade.py --exp exp-5 --evaluator strongreject_rubric
+  python strongreject_grade.py --expdir siva_experiments/exp-6 \
+         --evaluator strongreject_finetuned --base-model unsloth/gemma-2b
 """
-import argparse, glob, json, os, statistics as st
+import argparse, csv, glob, json, os, re, statistics as st
 from collections import defaultdict
 
-STRATS = ["affirm_method", "concrete_say", "stepwise_begin", "multispan_list"]
+FNAME_RE = re.compile(r"^p(\d+)_(.+)\.json$")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--exp", default="exp-5")
+    ap.add_argument("--exp", default="exp-5", help="exp dir name under --root")
+    ap.add_argument("--expdir", default=None, help="full path to exp dir (overrides --exp/--root)")
     ap.add_argument("--evaluator", default="strongreject_finetuned")
     ap.add_argument("--root", default=os.path.dirname(os.path.abspath(__file__)))
     ap.add_argument("--out", default=None)
     ap.add_argument("--base-model", default=None,
                     help="ungated base to load the finetuned LoRA onto, e.g. unsloth/gemma-2b "
-                         "(avoids the gated google/gemma-2b). Adapter = qylu4156/strongreject-15k-v1.")
+                         "(avoids gated google/gemma-2b). Adapter = qylu4156/strongreject-15k-v1.")
     args = ap.parse_args()
 
-    expdir = os.path.join(args.root, args.exp)
-    out = args.out or os.path.join(expdir, f"strongreject_scores_{args.evaluator}.csv")
+    expdir = args.expdir or os.path.join(args.root, args.exp)
+    out = args.out or os.path.join(expdir, "strongreject_scores.csv")
 
-    # --- gather rows -------------------------------------------------------
+    # --- gather rows; discover strategy names from filenames ---------------
     rows = []  # (pidx, strat, forbidden_prompt, response)
+    strategies = set()
     for fn in sorted(glob.glob(os.path.join(expdir, "p*_*.json"))):
-        base = os.path.basename(fn)[:-5]              # p0000_affirm_method
-        pidx, strat = base.split("_", 1)
-        if strat not in STRATS:
+        m = FNAME_RE.match(os.path.basename(fn))
+        if not m:
             continue
+        pidx, strat = int(m.group(1)), m.group(2)
+        strategies.add(strat)
         d = json.load(open(fn))
-        rows.append((int(pidx[1:]), strat, d["prompt"], d.get("text", "")))
-    print(f"loaded {len(rows)} responses from {expdir}")
+        rows.append((pidx, strat, d["prompt"], d.get("text", "")))
+    strategies = sorted(strategies)
+    print(f"loaded {len(rows)} responses from {expdir}  |  strategies: {strategies}")
+    if not rows:
+        raise SystemExit("no p*_*.json trace files found")
 
     # --- score with the official evaluator (batched dataset API) -----------
     from datasets import Dataset
@@ -78,11 +92,13 @@ def main():
     scored = evaluate_dataset(ds, [args.evaluator])
     scores = scored["score"]
 
-    # --- write per-cell csv ------------------------------------------------
-    with open(out, "w") as f:
-        f.write("prompt,strategy,score\n")
-        for (pidx, strat, _, _), s in zip(rows, scores):
-            f.write(f"{pidx},{strat},{s:.4f}\n")
+    # --- write ONE csv: every (prompt, strategy) response + score ----------
+    with open(out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["prompt_idx", "strategy", "score", "forbidden_prompt", "response"])
+        for (pidx, strat, prompt, resp), s in sorted(
+                zip(rows, scores), key=lambda x: (x[0][0], x[0][1])):
+            w.writerow([pidx, strat, f"{s:.4f}", prompt, resp])
     print(f"wrote {out}")
 
     # --- aggregate ---------------------------------------------------------
@@ -95,15 +111,16 @@ def main():
     print(f"\n=== StrongREJECT score [0,1], evaluator={args.evaluator} ===")
     print(f"OVERALL mean: {st.mean(scores):.3f}   (n={len(scores)})")
     print("\nPer-strategy mean:")
-    for s in STRATS:
-        v = by_strat[s]
-        print(f"  {s:<15} {st.mean(v):.3f}   (max {max(v):.2f})")
+    for strat in strategies:
+        v = by_strat[strat]
+        print(f"  {strat:<16} {st.mean(v):.3f}   (max {max(v):.2f}, n={len(v)})")
 
-    print("\nPer-prompt (mean across 4 strategies | best strategy):")
+    print("\nPer-prompt (best strategy):")
     for p in sorted(by_prompt):
         d = by_prompt[p]
         best = max(d, key=d.get)
-        print(f"  p{p:04d}  mean {st.mean(list(d.values())):.3f}   best {best}={d[best]:.2f}")
+        cells = "  ".join(f"{s}={d.get(s, float('nan')):.2f}" for s in strategies)
+        print(f"  p{p:04d}  {cells}   best={best}")
 
 
 if __name__ == "__main__":

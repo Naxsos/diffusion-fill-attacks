@@ -1542,8 +1542,41 @@ if active_tab == "Convergence":
                 format_func=lambda p: f"pos {p}" + ("  (steered)" if p in steered_set else ""),
             )
 
-            # Single column: distribution charts on top, canvas below — gives the
-            # canvas the full page width so longer outputs read in fewer rows.
+            # Canvas first — right under the slider so scrubbing the step
+            # immediately updates the token grid the user is watching. Full page
+            # width so longer outputs read in fewer rows.
+            st.markdown(f"##### Canvas at step {step}")
+            canvas_html = _step_canvas_html(decoded, step, all_positions, steered_set, focus=int(focus_pos))
+            # Tall, always-scrollable iframe — content of any size stays
+            # reachable via the iframe's own vertical scrollbar.
+            _render_canvas_iframe(
+                canvas_html,
+                height=820,
+                frame_style=(
+                    "border:1px solid #e3e3e3;border-radius:8px;padding:18px;"
+                    "background:#fff;font-family:monospace;font-size:18px;"
+                    "line-height:1.9;color:#111;"
+                    # The iframe sees `prefers-color-scheme` independently from the
+                    # parent; this opt-in lets `light-dark()` in the cell colors work.
+                    "color-scheme:light dark;"
+                ),
+                scrolling=True,
+            )
+            st.caption(
+                "Each glyph is the most-likely token at one position. "
+                "<span style='background:rgb(220,245,230);color:#111;padding:0 3px;"
+                "border-radius:3px'>"
+                "Green</span> intensity ∝ its probability — pale = uncertain, "
+                "<span style='background:rgb(22,163,74);color:#fff;padding:0 3px;border-radius:3px'>"
+                "super green</span> = committed (p≈1). "
+                "<span style='background:rgb(37,99,235);color:#fff;padding:0 3px;border-radius:3px'>"
+                "Blue</span> = injected/pinned (dashed border = steered this very step). "
+                "<span style='color:#ef4444'>Red box</span> = the focused position.",
+                unsafe_allow_html=True,
+            )
+
+            st.divider()
+            # Distribution charts below the canvas.
             st.markdown(f"##### Distribution at pos {focus_pos}, step {step}")
             dist = distribution_at(decoded, step, int(focus_pos), trace_topk_used)
             pre_dist = pre_distribution_at(decoded, step, int(focus_pos), trace_topk_used)
@@ -1635,37 +1668,6 @@ if active_tab == "Convergence":
                     "whole top-k distribution for this position, every timestep at once."
                 )
 
-            st.divider()
-            st.markdown(f"##### Canvas at step {step}")
-            canvas_html = _step_canvas_html(decoded, step, all_positions, steered_set, focus=int(focus_pos))
-            # Tall, always-scrollable iframe — content of any size stays
-            # reachable via the iframe's own vertical scrollbar.
-            _render_canvas_iframe(
-                canvas_html,
-                height=820,
-                frame_style=(
-                    "border:1px solid #e3e3e3;border-radius:8px;padding:18px;"
-                    "background:#fff;font-family:monospace;font-size:18px;"
-                    "line-height:1.9;color:#111;"
-                    # The iframe sees `prefers-color-scheme` independently from the
-                    # parent; this opt-in lets `light-dark()` in the cell colors work.
-                    "color-scheme:light dark;"
-                ),
-                scrolling=True,
-            )
-            st.caption(
-                "Each glyph is the most-likely token at one position. "
-                "<span style='background:rgb(220,245,230);color:#111;padding:0 3px;"
-                "border-radius:3px'>"
-                "Green</span> intensity ∝ its probability — pale = uncertain, "
-                "<span style='background:rgb(22,163,74);color:#fff;padding:0 3px;border-radius:3px'>"
-                "super green</span> = committed (p≈1). "
-                "<span style='background:rgb(37,99,235);color:#fff;padding:0 3px;border-radius:3px'>"
-                "Blue</span> = injected/pinned (dashed border = steered this very step). "
-                "<span style='color:#ef4444'>Red box</span> = the focused position.",
-                unsafe_allow_html=True,
-            )
-    
             st.divider()
             st.markdown("#### Streaming-process diagnostics")
             st.caption(

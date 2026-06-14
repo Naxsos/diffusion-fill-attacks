@@ -1,0 +1,43 @@
+{
+  "prompt": "A train goes 60 km/h for 2.5 hours, then 80 km/h for 1.5 hours. What total distance does it cover? Show each step, then give the final answer.",
+  "targets": [
+    "Second leg: 80 km/h x 1.5 h = 100 km."
+  ],
+  "start_pos": [
+    90
+  ],
+  "steps": [
+    0
+  ],
+  "modes": [
+    "pin"
+  ],
+  "k": 1,
+  "prob": null,
+  "seed": 0,
+  "all_held": true,
+  "positions": [
+    90,
+    91,
+    92,
+    93,
+    94,
+    95,
+    96,
+    97,
+    98,
+    99,
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111
+  ]
+}
