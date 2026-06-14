@@ -1547,11 +1547,11 @@ if active_tab == "Convergence":
             with canvas_col:
                 st.markdown(f"##### Canvas at step {step}")
                 canvas_html = _step_canvas_html(decoded, step, all_positions, steered_set, focus=int(focus_pos))
-                # Fixed-height, always-scrollable iframe — content of any size
-                # stays reachable via the iframe's own vertical scrollbar.
+                # Tall, always-scrollable iframe — content of any size stays
+                # reachable via the iframe's own vertical scrollbar.
                 _render_canvas_iframe(
                     canvas_html,
-                    height=460,
+                    height=820,
                     frame_style=(
                         "border:1px solid #e3e3e3;border-radius:8px;padding:18px;"
                         "background:#fff;font-family:monospace;font-size:18px;"
