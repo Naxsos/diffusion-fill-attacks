@@ -486,6 +486,536 @@ def _step_canvas_html(decoded: list[dict], step_idx: int, positions: list[int],
 
 
 # ---------------------------------------------------------------------------
+# SVG export of the step-by-step word display. Designed for figures in a paper:
+# light theme only, monospace font, every step from 0 → final stacked vertically
+# with a legend explaining the colors and the originating system prompt shown
+# above in a code-style box. Returns a self-contained <svg>...</svg> string.
+# ---------------------------------------------------------------------------
+
+def _svg_escape(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;").replace("'", "&apos;").replace('"', "&quot;"))
+
+
+def _rgb_str(rgb: tuple[int, int, int]) -> str:
+    r, g, b = rgb
+    return f"rgb({r},{g},{b})"
+
+
+def _mix_static(target: tuple[int, int, int], t: float) -> str:
+    """Light-mode-only sibling of `_mix_themed` -- always blends from white."""
+    t = max(0.0, min(1.0, t))
+    r, g, b = (round(c0 + (c1 - c0) * t)
+               for c0, c1 in zip(_CANVAS_WHITE, target))
+    return f"rgb({r},{g},{b})"
+
+
+def _wrap_lines(text: str, max_chars: int) -> list[str]:
+    """Wrap `text` into lines no longer than `max_chars` chars, respecting
+    explicit \n. Long words are hard-broken so the SVG never overflows."""
+    out: list[str] = []
+    for raw in text.split("\n"):
+        if not raw:
+            out.append("")
+            continue
+        words = raw.split(" ")
+        cur = ""
+        for w in words:
+            # hard-break a single oversized word
+            while len(w) > max_chars:
+                if cur:
+                    out.append(cur)
+                    cur = ""
+                out.append(w[:max_chars])
+                w = w[max_chars:]
+            if not cur:
+                cur = w
+            elif len(cur) + 1 + len(w) <= max_chars:
+                cur = f"{cur} {w}"
+            else:
+                out.append(cur)
+                cur = w
+        out.append(cur)
+    return out
+
+
+# Tokens we drop from the tail of the canvas in the SVG export. These are the
+# "the model parked an EOS here and never moved it" positions that aren't part
+# of the actual generation -- visually noisy in a paper figure. Lowercased,
+# whitespace-stripped before comparison.
+_EOS_TAIL_TOKENS = {
+    "<eos>", "</s>", "<pad>", "<|endoftext|>", "<|im_end|>", "<|end|>",
+    "<bos>", "<unk>", "<|endofresponse|>", "<|endofturn|>", "<end_of_turn>",
+    "[pad]", "[eos]",
+}
+
+
+def _trim_trailing_eos_positions(
+    decoded: list[dict], positions: list[int], steered_positions: set[int],
+) -> list[int]:
+    """Drop the longest contiguous *trailing* run of positions whose final-step
+    top-1 token is an EOS-like marker (or empty), AND that were never steered.
+
+    Steered positions are always kept so the figure honestly shows what was
+    pinned, even if the pinned token happens to be EOS.
+    """
+    if not decoded:
+        return list(positions)
+    last_rec = sorted(decoded, key=lambda r: r["step_idx"])[-1]
+    keep = list(positions)
+    while keep:
+        p = keep[-1]
+        if p in steered_positions:
+            break
+        cands = last_rec["positions"].get(p, [])
+        if not cands:
+            # Empty trailing slot -- definitely safe to drop.
+            keep.pop()
+            continue
+        tok = (cands[0].get("token") or "").strip().lower()
+        if tok in _EOS_TAIL_TOKENS or tok == "":
+            keep.pop()
+        else:
+            break
+    # If we trimmed *everything* (degenerate trace) keep the original list so
+    # the figure still has something to show.
+    return keep or list(positions)
+
+
+def _display_token_compact(tok: str) -> str:
+    """Token-string used inside SVG cells. Substitutions:
+      space  -> ·     newline -> ⏎     empty -> ∅
+      EOS / pad / endoftext / ...  -> ·    (keeps the cell tight in print)
+    """
+    raw = tok or ""
+    if raw.strip().lower() in _EOS_TAIL_TOKENS:
+        return "·"
+    return raw.replace(" ", "·").replace("\n", "⏎") or "∅"
+
+
+# A4 page geometry in millimetres. We fit the SVG content within a 10 mm
+# margin on every side so it drops cleanly into a LaTeX `\includegraphics` or
+# a blog post column at the correct physical scale.
+_A4_PORTRAIT_USABLE_MM = (190.0, 277.0)
+_A4_LANDSCAPE_USABLE_MM = (277.0, 190.0)
+# CSS px → mm. SVG renderers treat 1 user-unit ≈ 1 px @ 96 DPI = 0.264583 mm.
+_PX_TO_MM = 25.4 / 96.0
+
+
+def export_steps_as_svg(
+    decoded: list[dict],
+    system_prompt: str,
+    positions: list[int],
+    steered_positions: set[int],
+    *,
+    title: str = "Denoising trajectory",
+    trim_eos: bool = True,
+    paper: str = "a4-portrait",
+    step_stride: int = 1,
+    max_step: int | None = None,
+    step_list: list[int] | None = None,
+    compact: bool = False,
+) -> str:
+    """Build a self-contained SVG of the step-by-step word display.
+
+    Layout (top → bottom):
+      1. Title.
+      2. Legend explaining the colors / borders.
+      3. The originating system prompt rendered in a code-style box.
+      4. One row per denoising step, from step 0 to the final step. Each row
+         shows the same canvas the Convergence tab paints: most-likely token
+         per position, green tint ∝ confidence, blue for pinned, dashed-blue
+         border for "steered this very step".
+
+    Parameters
+    ----------
+    trim_eos : drop the trailing run of unsteered EOS / pad tokens so the
+        figure focuses on the actual generation rather than the empty tail.
+    paper : ``"a4-portrait"`` (default), ``"a4-landscape"``, or ``"natural"``.
+        For the A4 modes the SVG is given physical ``width=""mm`` /
+        ``height=""mm`` attributes that scale it to fit the usable area
+        (190×277 mm or 277×190 mm with 10 mm margins). The internal
+        ``viewBox`` is unchanged, so text stays sharp and the aspect ratio is
+        preserved -- ideal for ``\\includegraphics[width=\\textwidth]`` or a
+        blog-post full-page figure.
+    step_stride : sample every Nth step. ``1`` keeps every traced step; ``5``
+        keeps step 0, 5, 10, … The first and last surviving steps are always
+        retained so the figure still shows the start and the converged state.
+        Ignored if ``step_list`` is given.
+    max_step : if given, drop any step whose ``step_idx`` exceeds this value
+        BEFORE striding. Useful when convergence happens well before the end
+        of the trace and the tail is just visual noise. Ignored if
+        ``step_list`` is given.
+    step_list : explicit list of step indices to include (e.g. ``[0, 3, 8,
+        20, 47]``). When provided it OVERRIDES both ``step_stride`` and
+        ``max_step``. Indices not present in the trace are silently dropped.
+    compact : if True, render with much thinner step rows (smaller font,
+        less padding, tighter card gap) so the figure reads as a dense
+        heatmap-style strip suitable for inline use in a blog post. Each
+        step row collapses to roughly half its normal height.
+    """
+    # Trim trailing unused EOS / pad / empty positions so the figure is about
+    # the actual generation, not the silent tail of the canvas.
+    if trim_eos:
+        positions = _trim_trailing_eos_positions(decoded, list(positions), steered_positions)
+    else:
+        positions = list(positions)
+
+    # ------------- typography & cell metrics (monospace -> deterministic) -------
+    # `compact=True` shrinks every per-cell metric so each step row is roughly
+    # half as tall -- handy for embedding in a blog post where vertical space
+    # is precious. The legend / prompt block keep their full size so they
+    # still read as headers.
+    font_family = "ui-monospace, SFMono-Regular, Menlo, monospace"
+    if compact:
+        font_size = 10
+        char_w = 6.05      # advance @ 10px monospace
+        pad_x = 2
+        pad_y = 1
+        cell_gap = 1
+        row_v_gap = 2
+        label_w = 52
+    else:
+        font_size = 13
+        char_w = 7.85      # advance @ 13px monospace
+        pad_x = 4
+        pad_y = 3
+        cell_gap = 2
+        row_v_gap = 4
+        label_w = 70
+    cell_h = font_size + 2 * pad_y + 4
+    margin = 24
+    by_step = sorted(decoded, key=lambda r: r["step_idx"])
+    if not by_step:
+        return f"<svg xmlns='http://www.w3.org/2000/svg'><text x='10' y='20'>(no trace data)</text></svg>"
+
+    # Some traces emit MULTIPLE records for the same step_idx (e.g. block-wise
+    # decoding writes per-block records). The on-screen Convergence view picks
+    # the first match per step; the exporter used to draw a separate card for
+    # each record, which made one denoising step appear as two boxes. Merge
+    # records sharing a step_idx so we always get exactly one card per step.
+    # Merge rule: union of positions (later record wins on conflict) and union
+    # of steered_positions / pre_positions.
+    merged: dict[int, dict] = {}
+    for rec in by_step:
+        sid = rec["step_idx"]
+        if sid not in merged:
+            merged[sid] = {
+                "step_idx": sid,
+                "positions": dict(rec.get("positions", {})),
+                "steered_positions": list(rec.get("steered_positions", []) or []),
+                "pre_positions": dict(rec.get("pre_positions", {}) or {}),
+            }
+        else:
+            m = merged[sid]
+            for p, cands in (rec.get("positions") or {}).items():
+                # Prefer the candidate list that actually has content; on tie,
+                # keep the one we already had (first wins for the visible token).
+                if cands and not m["positions"].get(p):
+                    m["positions"][p] = cands
+            m["steered_positions"] = sorted(
+                set(m["steered_positions"]) | set(rec.get("steered_positions", []) or [])
+            )
+            for p, cands in (rec.get("pre_positions") or {}).items():
+                m["pre_positions"].setdefault(p, cands)
+    by_step = [merged[k] for k in sorted(merged.keys())]
+
+    # Optional: cap the trace at `max_step` and / or sample every Nth step,
+    # OR pick an explicit list of step indices. step_list wins when given.
+    if step_list is not None:
+        wanted = {int(s) for s in step_list}
+        by_step = [rec for rec in by_step if rec["step_idx"] in wanted]
+        if not by_step:
+            return f"<svg xmlns='http://www.w3.org/2000/svg'><text x='10' y='20'>(no matching steps)</text></svg>"
+    else:
+        if max_step is not None:
+            by_step = [rec for rec in by_step if rec["step_idx"] <= max_step]
+            if not by_step:
+                return f"<svg xmlns='http://www.w3.org/2000/svg'><text x='10' y='20'>(no steps in range)</text></svg>"
+        stride = max(1, int(step_stride))
+        if stride > 1:
+            kept = by_step[::stride]
+            if by_step[-1] not in kept:
+                kept.append(by_step[-1])
+            by_step = kept
+
+    # Canvas width = system-prompt-box width. We pick a fixed natural width
+    # that scales cleanly to A4 (190 mm at the typical 96 DPI). Each step
+    # card is rendered at the same width; the card's HEIGHT grows as needed
+    # so the full token sequence wraps inside the same single card -- never
+    # split across two cards, never overflow the page width.
+    canvas_w_max = 720
+
+    # ------------- legend ------------------------------------------------------
+    # No top-level title -- the figure starts directly with the legend so it
+    # drops cleanly into a blog post / paper figure where the caption usually
+    # serves as the title.
+    parts: list[str] = []
+    y_cursor = margin
+
+    # Legend: three colour swatches, laid out with deterministic widths so they
+    # never overlap regardless of the label / description length.
+    legend_items = [
+        ("Pale green", "uncertain (low top-1 prob)", _mix_static(_CANVAS_GREEN, 0.18)),
+        ("Solid green", "committed (top-1 ≈ 1)", _mix_static(_CANVAS_GREEN, 1.0)),
+        ("Blue", "injected / pinned position", _mix_static(_CANVAS_BLUE, 0.85)),
+    ]
+
+    legend_font_size = 11
+    legend_char_w = 6.6  # monospace advance @ 11px, slight padding included
+    sw = 18              # swatch size
+    swatch_text_gap = 6
+    item_gap = 24
+
+    parts.append(
+        f"<text x='{margin}' y='{y_cursor + 12}' font-family='{font_family}' "
+        f"font-size='{legend_font_size}' font-weight='700' "
+        f"fill='#374151'>Legend</text>"
+    )
+    y_cursor += 22
+
+    lx = margin
+    for label, desc, fill in legend_items:
+        parts.append(
+            f"<rect x='{lx}' y='{y_cursor}' width='{sw}' height='{sw}' "
+            f"rx='3' ry='3' fill='{fill}' stroke='#d4d4d8' />"
+        )
+        parts.append(
+            f"<text x='{lx + sw + swatch_text_gap}' y='{y_cursor + 13}' "
+            f"font-family='{font_family}' font-size='{legend_font_size}' "
+            f"fill='#111'>"
+            f"<tspan font-weight='700'>{_svg_escape(label)}</tspan> "
+            f"<tspan fill='#4b5563'>— {_svg_escape(desc)}</tspan></text>"
+        )
+        # advance by exact text width + swatch + gap so items can't run into each other
+        text_w = (len(label) + 3 + len(desc)) * legend_char_w  # " — " between
+        lx += sw + swatch_text_gap + text_w + item_gap
+
+    # Total legend right-edge (minus the trailing item_gap we added on the
+    # final iteration) -- used below so the SVG width can grow to fit the
+    # legend even when the step canvas itself is narrower.
+    legend_right_edge = lx - item_gap + margin
+    y_cursor += sw + 18
+
+    # ------------- system prompt block (code-style) ----------------------------
+    # The system-prompt box and every step box share the same left edge and
+    # right edge so they line up vertically on the page. The right edge is
+    # whichever is wider: the legend's right edge, or the natural canvas width
+    # (so a really wide canvas isn't truncated). Box left = page margin.
+    box_left = margin
+    box_right = max(canvas_w_max - margin, legend_right_edge)
+    box_w = box_right - box_left
+    box_pad_x = 12
+    box_pad_y = 10
+
+    prompt_text = (system_prompt or "").rstrip()
+    if prompt_text:
+        # Heading
+        parts.append(
+            f"<text x='{margin}' y='{y_cursor + 12}' font-family='{font_family}' "
+            f"font-size='11' font-weight='700' fill='#374151' "
+            f"letter-spacing='0.05em'>SYSTEM PROMPT</text>"
+        )
+        y_cursor += 18
+        max_chars = max(20, int((box_w - 2 * box_pad_x) / char_w))
+        lines = _wrap_lines(prompt_text, max_chars)
+        line_h = font_size + 4
+        prompt_box_h = line_h * len(lines) + 18
+        parts.append(
+            f"<rect x='{box_left}' y='{y_cursor}' "
+            f"width='{box_w}' height='{prompt_box_h}' "
+            f"rx='6' ry='6' fill='#f6f8fa' stroke='#d0d7de' stroke-width='1' />"
+        )
+        ty = y_cursor + 14
+        for ln in lines:
+            parts.append(
+                f"<text x='{box_left + box_pad_x}' y='{ty + font_size - 2}' "
+                f"font-family='{font_family}' font-size='{font_size}' "
+                f"fill='#111' xml:space='preserve'>{_svg_escape(ln) or ' '}</text>"
+            )
+            ty += line_h
+        y_cursor += prompt_box_h + 18
+
+    # ------------- step rows ---------------------------------------------------
+    parts.append(
+        f"<text x='{margin}' y='{y_cursor + 12}' font-family='{font_family}' "
+        f"font-size='11' font-weight='700' fill='#374151' "
+        f"letter-spacing='0.05em'>DENOISING STEPS</text>"
+    )
+    y_cursor += 22
+
+    rendered_canvas_widths: list[float] = []
+    # Each step is rendered inside its own light-grey rounded card whose left
+    # and right edges align with the SYSTEM PROMPT box. A small vertical gap
+    # separates consecutive cards so they read as discrete denoising steps.
+    # Compact mode shrinks both the card padding and the inter-card gap.
+    if compact:
+        step_card_gap = 4
+        step_card_pad_y = 3
+    else:
+        step_card_gap = 10
+        step_card_pad_y = 8
+    step_card_pad_x = box_pad_x   # share padding with the prompt box for alignment
+    # Token wrap budget *inside* a step card.
+    wrap_inner_left = box_left + step_card_pad_x
+    # Step label sits at the very left of the card; tokens flow to its right.
+    step_label_w = label_w
+    wrap_inner_token_left = wrap_inner_left + step_label_w
+    wrap_width = (box_left + box_w - step_card_pad_x) - wrap_inner_token_left
+
+    for rec in by_step:
+        active_steered: set[int] = set(rec.get("steered_positions", []))
+        step_label = f"step {rec['step_idx']:>3}"
+
+        # Pass 1: lay out cells WITHOUT emitting SVG, to learn how tall this
+        # step card needs to be. We collect (x, y_offset, cell_w, ...) tuples
+        # and replay them in pass 2 once we know the card's final top.
+        cell_specs: list[tuple] = []  # (kind, x, line_idx, w, payload)
+        x_cursor = wrap_inner_token_left
+        line_idx = 0
+        max_line_right = x_cursor
+
+        for pos in positions:
+            cands = rec["positions"].get(pos, [])
+            if not cands:
+                tok_disp = "·"
+                cell_w = max(1, len(tok_disp)) * char_w + 2 * pad_x
+                if x_cursor != wrap_inner_token_left and x_cursor + cell_w > wrap_inner_token_left + wrap_width:
+                    line_idx += 1
+                    x_cursor = wrap_inner_token_left
+                cell_specs.append(("empty", x_cursor, line_idx, cell_w, tok_disp))
+                x_cursor += cell_w + cell_gap
+                max_line_right = max(max_line_right, x_cursor)
+                continue
+
+            tok = cands[0]["token"]
+            post_prob = float(cands[0]["prob"])
+            display = _display_token_compact(tok)
+            is_pinned = pos in steered_positions or pos in active_steered
+            if is_pinned:
+                t = max(post_prob, 0.45)
+                bg = _mix_static(_CANVAS_BLUE, t)
+            else:
+                t = post_prob
+                bg = _mix_static(_CANVAS_GREEN, t)
+            txt_color = "#fff" if t > 0.55 else "#111"
+            font_weight = 700 if post_prob > 0.85 else 500
+            if pos in active_steered:
+                stroke_attr = "stroke='#60a5fa' stroke-width='1.5' stroke-dasharray='3,2'"
+            else:
+                stroke_attr = "stroke='#d4d4d8' stroke-width='1'"
+            cell_w = max(1, len(display)) * char_w + 2 * pad_x
+            if x_cursor != wrap_inner_token_left and x_cursor + cell_w > wrap_inner_token_left + wrap_width:
+                line_idx += 1
+                x_cursor = wrap_inner_token_left
+            cell_specs.append((
+                "cell", x_cursor, line_idx, cell_w,
+                (display, bg, stroke_attr, txt_color, font_weight),
+            ))
+            x_cursor += cell_w + cell_gap
+            max_line_right = max(max_line_right, x_cursor)
+
+        n_lines = line_idx + 1 if cell_specs else 1
+        card_content_h = n_lines * cell_h + (n_lines - 1) * cell_gap
+        card_h = card_content_h + 2 * step_card_pad_y
+        card_top = y_cursor
+
+        # Draw the card frame.
+        parts.append(
+            f"<rect x='{box_left}' y='{card_top}' "
+            f"width='{box_w}' height='{card_h}' rx='6' ry='6' "
+            f"fill='#f8f9fb' stroke='#e5e7eb' stroke-width='1' />"
+        )
+        # Step label (vertical-centred against the first row of glyphs).
+        first_line_top = card_top + step_card_pad_y
+        parts.append(
+            f"<text x='{box_left + step_card_pad_x}' "
+            f"y='{first_line_top + cell_h - pad_y - 1}' "
+            f"font-family='{font_family}' font-size='11' "
+            f"fill='#6b7280'>{_svg_escape(step_label)}</text>"
+        )
+
+        # Pass 2: emit cells using the recorded layout.
+        for spec in cell_specs:
+            kind, cx, ci, cw, payload = spec
+            cy_top = first_line_top + ci * (cell_h + cell_gap)
+            if kind == "empty":
+                tok_disp = payload
+                parts.append(
+                    f"<text x='{cx + pad_x}' "
+                    f"y='{cy_top + cell_h - pad_y - 2}' "
+                    f"font-family='{font_family}' font-size='{font_size}' "
+                    f"fill='#9ca3af'>{tok_disp}</text>"
+                )
+            else:
+                display, bg, stroke_attr, txt_color, font_weight = payload
+                parts.append(
+                    f"<rect x='{cx}' y='{cy_top}' "
+                    f"width='{cw:.2f}' height='{cell_h}' rx='3' ry='3' "
+                    f"fill='{bg}' {stroke_attr} />"
+                )
+                parts.append(
+                    f"<text x='{cx + pad_x}' "
+                    f"y='{cy_top + cell_h - pad_y - 2}' "
+                    f"font-family='{font_family}' font-size='{font_size}' "
+                    f"font-weight='{font_weight}' fill='{txt_color}' "
+                    f"xml:space='preserve'>{_svg_escape(display)}</text>"
+                )
+
+        rendered_canvas_widths.append(max_line_right + step_card_pad_x + (box_left - margin) + margin)
+        y_cursor = card_top + card_h + step_card_gap
+
+    # Trim the dangling card_gap so the bottom margin reads consistently.
+    if by_step:
+        y_cursor -= step_card_gap
+
+    # Final SVG dimensions: fit the widest of (legend, step canvas), plus margins.
+    final_w = max(canvas_w_max, legend_right_edge,
+                  *rendered_canvas_widths) if rendered_canvas_widths else max(canvas_w_max, legend_right_edge)
+    final_h = y_cursor + margin
+
+    # Physical sizing for A4. Without these attributes a renderer treats the
+    # SVG as 1 user-unit = 1 px; with them the file scales to the page.
+    if paper in ("a4-portrait", "a4-landscape"):
+        usable_mm_w, usable_mm_h = (
+            _A4_PORTRAIT_USABLE_MM if paper == "a4-portrait"
+            else _A4_LANDSCAPE_USABLE_MM
+        )
+        natural_w_mm = final_w * _PX_TO_MM
+        natural_h_mm = final_h * _PX_TO_MM
+        # Scale to the tighter of the two axes; preserveAspectRatio keeps the
+        # ratio from viewBox, so giving width OR height alone would suffice,
+        # but emitting both lets readers like Inkscape & LaTeX agree on size.
+        scale = min(usable_mm_w / natural_w_mm, usable_mm_h / natural_h_mm)
+        out_w_mm = natural_w_mm * scale
+        out_h_mm = natural_h_mm * scale
+        size_attr = f"width='{out_w_mm:.2f}mm' height='{out_h_mm:.2f}mm'"
+    else:
+        size_attr = f"width='{final_w:.0f}' height='{final_h:.0f}'"
+
+    body = "\n".join(parts)
+    return (
+        f"<svg xmlns='http://www.w3.org/2000/svg' "
+        f"viewBox='0 0 {final_w:.0f} {final_h:.0f}' "
+        f"{size_attr} preserveAspectRatio='xMidYMid meet' "
+        f"font-family='{font_family}'>"
+        f"<rect x='0' y='0' width='100%' height='100%' fill='#ffffff' />"
+        f"{body}"
+        f"</svg>"
+    )
+
+
+def _render_token(rec: dict, pos: int) -> str:
+    """Return the most-likely token's display string at `pos` in `rec` -- used
+    for width estimation only; uses the same `·`/`⏎`/EOS->'·' substitutions
+    as the on-screen canvas so the SVG fits."""
+    cands = rec["positions"].get(pos, [])
+    if not cands:
+        return "·"
+    return _display_token_compact(cands[0]["token"])
+
+
+# ---------------------------------------------------------------------------
 # Dynamic targets state. One row = one --target with its parallel start_pos /
 # step / prob. Add a row with the per-row "+" button; remove with "🗑".
 # ---------------------------------------------------------------------------
@@ -1539,6 +2069,137 @@ if active_tab == "Convergence":
                 "Blue</span> = injected/pinned (dashed border = steered this very step).",
                 unsafe_allow_html=True,
             )
+
+            # Paper-figure export: every step from 0 → final stacked vertically,
+            # legend + system prompt at the top, light theme only. SVG is
+            # self-contained so it drops straight into LaTeX / Inkscape / a browser.
+            # Trailing unused EOS / pad positions are trimmed and the SVG is sized
+            # to fit a full A4 page (10 mm margins, aspect ratio preserved) so it
+            # works as a full-page blog-post / paper figure.
+            with st.expander("📄 Export as SVG (paper / blog figure)", expanded=False):
+                last_step_idx = int(all_steps[-1])
+
+                svg_step_mode = st.radio(
+                    "Which steps to include",
+                    options=["Every Nth step", "Explicit list of steps"],
+                    horizontal=True,
+                    key="svg_step_mode",
+                    help=(
+                        "Choose the rule for which steps end up in the SVG. "
+                        "'Every Nth step' samples uniformly; 'Explicit list' "
+                        "lets you cherry-pick (e.g. 0,3,8,20,47)."
+                    ),
+                )
+
+                if svg_step_mode == "Every Nth step":
+                    ctrl_a, ctrl_b = st.columns(2)
+                    with ctrl_a:
+                        svg_stride = st.number_input(
+                            "Show every Nth step",
+                            min_value=1, max_value=max(1, last_step_idx),
+                            value=1, step=1,
+                            help=(
+                                "1 = every traced step. 5 = step 0, 5, 10, … "
+                                "The first and last surviving step are always kept."
+                            ),
+                            key="svg_stride",
+                        )
+                    with ctrl_b:
+                        svg_max_step = st.number_input(
+                            "Stop at step (inclusive)",
+                            min_value=int(all_steps[0]), max_value=last_step_idx,
+                            value=last_step_idx, step=1,
+                            help=(
+                                "Drop any step beyond this index BEFORE striding. "
+                                "Useful when convergence happens well before the trace ends."
+                            ),
+                            key="svg_max_step",
+                        )
+                    parsed_step_list = None
+                else:
+                    raw_list = st.text_input(
+                        "Step indices (comma- or space-separated)",
+                        value=f"0,{last_step_idx}",
+                        key="svg_step_list_text",
+                        help=(
+                            "Cherry-pick exactly which steps appear. Example: "
+                            "`0, 3, 8, 20, 47`. Indices not present in the trace "
+                            "are silently dropped."
+                        ),
+                    )
+                    # Tolerant parse: split on commas / whitespace, keep the ints.
+                    tokens = [t for t in raw_list.replace(",", " ").split() if t]
+                    parsed_step_list = []
+                    for t in tokens:
+                        try:
+                            parsed_step_list.append(int(t))
+                        except ValueError:
+                            pass
+                    if parsed_step_list:
+                        st.caption(
+                            f"Will export **{len(parsed_step_list)}** step(s): "
+                            + ", ".join(str(s) for s in parsed_step_list)
+                        )
+                    else:
+                        st.warning(
+                            "No valid step indices parsed -- the export will fall "
+                            "back to the full trace."
+                        )
+                        parsed_step_list = None
+                    svg_stride = 1
+                    svg_max_step = last_step_idx
+
+                _svg_kwargs = dict(
+                    decoded=decoded,
+                    system_prompt=last.get("prompt", ""),
+                    positions=all_positions,
+                    steered_positions=steered_set,
+                    title="Denoising trajectory (step 0 → convergence)",
+                    trim_eos=True,
+                    step_stride=int(svg_stride),
+                    max_step=int(svg_max_step),
+                    step_list=parsed_step_list,
+                )
+
+                svg_compact = st.toggle(
+                    "Compact step rows (denser, blog-post-friendly)",
+                    value=False,
+                    key="svg_compact",
+                    help=(
+                        "Renders each step with smaller font and tighter "
+                        "padding so the figure reads as a heatmap-style strip "
+                        "instead of a tall page. Roughly halves the height."
+                    ),
+                )
+                _svg_kwargs["compact"] = bool(svg_compact)
+
+                exp_col1, exp_col2 = st.columns(2)
+                with exp_col1:
+                    svg_portrait = export_steps_as_svg(paper="a4-portrait", **_svg_kwargs)
+                    st.download_button(
+                        "⬇ Export as SVG — A4 portrait (full page)",
+                        data=svg_portrait,
+                        file_name="denoising_steps_a4_portrait.svg",
+                        mime="image/svg+xml",
+                        help=(
+                            "Self-contained SVG sized to a full A4 portrait page "
+                            "(190×277 mm usable, 10 mm margins). Trailing unused "
+                            "EOS / pad tokens are trimmed."
+                        ),
+                    )
+                with exp_col2:
+                    svg_landscape = export_steps_as_svg(paper="a4-landscape", **_svg_kwargs)
+                    st.download_button(
+                        "⬇ Export as SVG — A4 landscape",
+                        data=svg_landscape,
+                        file_name="denoising_steps_a4_landscape.svg",
+                        mime="image/svg+xml",
+                        help=(
+                            "Same content, sized to A4 landscape (277×190 mm "
+                            "usable). Pick this when the canvas is wide and "
+                            "portrait would shrink the tokens too far."
+                        ),
+                    )
 
             st.divider()
             st.markdown("#### Streaming-process diagnostics")
