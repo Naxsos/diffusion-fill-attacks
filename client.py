@@ -12,7 +12,7 @@ From the shell:
     .venv/bin/python client.py --host a100-box --max-new-tokens 256 "Explain MoE."
 """
 
-from __future__ import annotations
+from __future__ import annotations 
 
 import argparse
 import json
